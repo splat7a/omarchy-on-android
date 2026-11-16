@@ -1,0 +1,12 @@
+# Anland display path + KGSL Mesa (same GPU settings as Anland's own Arch launchers).
+export ANLAND=1
+export ANLAND_SOCKET=/run/display.sock
+export ANLAND_DRM_DEVICE=/dev/dri/renderD128
+export ANLAND_SKIP_IMPLICIT_SYNC_WAIT=1
+export MESA_LOADER_DRIVER_OVERRIDE=kgsl
+export GALLIUM_DRIVER=kgsl
+export FD_FORCE_KGSL=1
+export TURNIP_KMD=kgsl
+export MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE=1
+export FD_DEV_FEATURES=enable_tp_ubwc_flag_hint=1
+export XWAYLAND_GBM_DEVICE=/dev/dri/renderD128

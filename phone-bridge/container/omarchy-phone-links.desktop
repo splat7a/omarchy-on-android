@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Phone links
+Comment=Open phone numbers, text messages and store links on the S22
+Exec=omarchy-phone open %u
+Icon=phone
+NoDisplay=true
+Terminal=false
+MimeType=x-scheme-handler/tel;x-scheme-handler/sms;x-scheme-handler/smsto;x-scheme-handler/mms;x-scheme-handler/market;

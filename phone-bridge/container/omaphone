@@ -1,0 +1,4 @@
+#!/bin/sh
+# S22 stand-in for omatel's Phone app (omaphone): the call card's "open the Phone app" shows
+# Android's own call screen instead.
+exec omarchy-phone incall

@@ -1,0 +1,6 @@
+*.img
+*.apk
+*.keystore
+*.jks
+*.pkg.tar.*
+logs/

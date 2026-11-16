@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""omarchy-phone-reply TITLE [LABEL]: ask for the text of a reply to an Android notification.
+Prints the text on stdout (nothing when cancelled with Escape or by closing the window)."""
+import sys
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gio, Gtk  # noqa: E402
+
+title = sys.argv[1] if len(sys.argv) > 1 else ""
+label = sys.argv[2] if len(sys.argv) > 2 else "Reply"
+
+
+def activate(app):
+    win = Gtk.ApplicationWindow(application=app, title=f"{label}: {title}" if title else label)
+    win.set_default_size(480, -1)
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                  margin_top=16, margin_bottom=16, margin_start=16, margin_end=16)
+    heading = Gtk.Label(label=f"{label} to {title}" if title else label, xalign=0)
+    heading.set_wrap(True)
+    entry = Gtk.Entry(placeholder_text="Message")
+    send_button = Gtk.Button(label="Send")
+    send_button.add_css_class("suggested-action")
+
+    def send(*_a):
+        text = entry.get_text().strip()
+        if text:
+            print(text, flush=True)
+        app.quit()
+
+    def key(_c, keyval, _code, _state):
+        if keyval == 0xFF1B:  # Escape
+            app.quit()
+            return True
+        return False
+
+    entry.connect("activate", send)
+    send_button.connect("clicked", send)
+    keys = Gtk.EventControllerKey()
+    keys.connect("key-pressed", key)
+    win.add_controller(keys)
+    for w in (heading, entry, send_button):
+        box.append(w)
+    win.set_child(box)
+    win.present()
+    entry.grab_focus()
+
+
+app = Gtk.Application(application_id="org.omarchy.PhoneReply", flags=Gio.ApplicationFlags.NON_UNIQUE)
+app.connect("activate", activate)
+sys.exit(app.run([sys.argv[0]]))

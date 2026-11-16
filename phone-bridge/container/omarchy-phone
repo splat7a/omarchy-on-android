@@ -1,0 +1,742 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""omarchy-phone: the S22's Android phone inside Omarchy.
+
+The daemon (systemd user unit omarchy-phone.service) accepts the Omarchy Phone app's connection
+from Android over the container's private network (the app and this daemon prove a shared token
+to each other first), and
+
+  - shows Android notifications as Omarchy notifications: click opens it on the screen Omarchy is
+    on, buttons run the app's actions, "Reply" asks for text, dismissing clears it on the phone;
+  - serves org.omamobile.Phone1 and org.omamobile.Messages1 on the session bus, the API of
+    Omarchy Mobile's own phone stack, so its call card and status bar work unchanged (answer,
+    decline, hang up, mute, speaker, quick-reply SMS); with no call card loaded (the desktop
+    profile on a monitor) calls ring as notifications with Answer and Decline;
+  - writes the mobile network and Wi-Fi state for the status bar ($XDG_RUNTIME_DIR/omarchy-phone);
+  - lists the phone's Android apps in the Omarchy launcher (~/.local/share/applications).
+
+CLI (talks to the daemon):
+  omarchy-phone launch PACKAGE[/ACTIVITY]   start an Android app on Omarchy's screen
+  omarchy-phone open URI                    tel:, sms:, mailto:, geo:, market:, https: ... in Android
+  omarchy-phone sms NUMBER TEXT             send a text message
+  omarchy-phone incall                      show Android's call screen
+  omarchy-phone settings [PAGE]             an Android settings page: wifi (default), mobile, network,
+                                            bluetooth, battery, sound, display, all
+  omarchy-phone apps                        refresh the Android apps in the launcher
+  omarchy-phone test-call [NUMBER] [NAME]   a pretend incoming call through Android's Telecom (no SIM needed)
+  omarchy-phone status                      connection, network and call state as JSON
+"""
+
+import base64
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "omarchy-phone"
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "omarchy-phone"
+DATA_HOME = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state")
+DATA = DATA_HOME / "omarchy-phone"
+# Android app icons as theme icons ("android-<package>"): the shell takes icon names, not paths.
+ICONS = DATA_HOME / "icons" / "hicolor" / "128x128" / "apps"
+APPS_DIR = DATA_HOME / "applications"
+CTL = RUNTIME / "ctl.sock"
+ANDROID_DISPLAY = Path("/var/lib/omarchy-s22/android-display")
+PORT = 47700
+HIDDEN_APPS = {"com.s22.omarchyphone", "com.anland.consumer"}
+
+PHONE = "org.omamobile.Phone1"
+PHONE_PATH = "/org/omamobile/Phone1"
+MESSAGES = "org.omamobile.Messages1"
+MESSAGES_PATH = "/org/omamobile/Messages1"
+CALL_CARD = "org.omamobile.CallCard"
+PROPS = "org.freedesktop.DBus.Properties"
+NOTIFY = "org.freedesktop.Notifications"
+NOTIFY_PATH = "/org/freedesktop/Notifications"
+CALL_KEY = "\0call"
+NO_CELL = {"modem": False, "state": "none", "strength": -1, "tech": "", "roaming": False}
+
+
+def mac(token, msg):
+    return hmac.new(token.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+
+def write_in_place(path, text):
+    # In place, not by rename: the shell's file watchers follow the inode.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
+
+
+def android_display():
+    try:
+        return int(ANDROID_DISPLAY.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def listen_host():
+    env = os.environ.get("OMARCHY_PHONE_LISTEN")
+    if env:
+        return env
+    # The container's own address on Droidspaces' network: reachable from Android on this phone only.
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", "dev", "eth0"],
+                             capture_output=True, text=True, timeout=3).stdout.split()
+        return out[3].split("/")[0]
+    except (OSError, IndexError, subprocess.SubprocessError):
+        return None
+
+
+def markup(text):
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+class Conn:
+    def __init__(self, sock, addr):
+        self.sock, self.addr = sock, addr
+        self.buf = b""
+        self.nonce = secrets.token_hex(16)
+        self.authed = False
+        self.watch = None
+        self.born = time.monotonic()
+
+    def send(self, obj):
+        try:
+            self.sock.sendall((json.dumps(obj, separators=(",", ":")) + "\n").encode())
+            return True
+        except OSError:
+            return False
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class Bridge:
+    def __init__(self):
+        import dbus
+        import dbus.mainloop.glib
+        from gi.repository import GLib
+
+        self.dbus, self.GLib = dbus, GLib
+        dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+        self.bus = dbus.SessionBus()
+        self.loop = GLib.MainLoop()
+        self.token = (CONFIG / "token").read_text().strip()
+        RUNTIME.mkdir(parents=True, exist_ok=True)
+        ICONS.mkdir(parents=True, exist_ok=True)
+        self.conn = None
+        self.pending = []
+        self.hello = {}
+        self.notes, self.ids = {}, {}         # android key <-> notification id
+        self.note_actions = {}                # android key -> {action id: title}
+        self.calls, self.muted, self.route, self.bound = [], False, "earpiece", False
+        self.call_note_state = None
+        self.reply_procs = []
+        self.versions = self._load_versions()
+        self.cell = dict(NO_CELL)
+        write_in_place(RUNTIME / "cell.json", json.dumps(NO_CELL))
+        write_in_place(RUNTIME / "wifi.json", '{"bridge":false}')
+        self.phone = make_phone_agent(self)
+        self.messages = make_messages_agent(self)
+        self.markup = True
+        try:
+            caps = self._notifier().GetCapabilities()
+            self.markup = "body-markup" in [str(c) for c in caps]
+        except dbus.DBusException:
+            pass
+        self.bus.add_signal_receiver(self.on_action, signal_name="ActionInvoked", dbus_interface=NOTIFY, path=NOTIFY_PATH)
+        self.bus.add_signal_receiver(self.on_closed, signal_name="NotificationClosed", dbus_interface=NOTIFY, path=NOTIFY_PATH)
+        self.server = None
+        self._listen()
+        self._control()
+        GLib.timeout_add_seconds(30, self._tick)
+
+    # ------------------------------------------------------------ plumbing
+
+    @staticmethod
+    def _remove(path):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+    def _notifier(self):
+        return self.dbus.Interface(self.bus.get_object(NOTIFY, NOTIFY_PATH), NOTIFY)
+
+    def _load_versions(self):
+        try:
+            return json.loads((DATA / "apps.json").read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def _listen(self):
+        host = listen_host()
+        if not host:
+            self.GLib.timeout_add_seconds(5, lambda: (self._listen(), False)[1])
+            return
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((host, PORT))
+            s.listen(4)
+        except OSError as e:
+            print(f"omarchy-phone: cannot listen on {host}:{PORT}: {e}", file=sys.stderr, flush=True)
+            self.GLib.timeout_add_seconds(5, lambda: (self._listen(), False)[1])
+            return
+        self.server = s
+        self.GLib.io_add_watch(s.fileno(), self.GLib.IO_IN, self._accept)
+        print(f"omarchy-phone: listening on {host}:{PORT}", flush=True)
+
+    def _accept(self, *_a):
+        try:
+            sock, addr = self.server.accept()
+        except OSError:
+            return True
+        sock.settimeout(5)
+        c = Conn(sock, addr)
+        c.watch = self.GLib.io_add_watch(sock.fileno(), self.GLib.IO_IN | self.GLib.IO_HUP | self.GLib.IO_ERR,
+                                         lambda *_: self._readable(c))
+        self.pending.append(c)
+        c.send({"t": "challenge", "nonce": c.nonce})
+        return True
+
+    def _drop(self, c):
+        if c.watch:
+            self.GLib.source_remove(c.watch)
+            c.watch = None
+        c.close()
+        if c in self.pending:
+            self.pending.remove(c)
+        if self.conn is c:
+            self.conn = None
+            self.hello = {}
+            print("omarchy-phone: phone disconnected", flush=True)
+            self._set_cell(dict(NO_CELL))
+            write_in_place(RUNTIME / "wifi.json", '{"bridge":false}')
+            self._set_calls([], False, "earpiece", False)
+
+    def _readable(self, c):
+        try:
+            data = c.sock.recv(65536)
+        except OSError:
+            data = b""
+        if not data:
+            self._drop(c)
+            return False
+        c.buf += data
+        if len(c.buf) > 16 * 1024 * 1024:
+            self._drop(c)
+            return False
+        while b"\n" in c.buf:
+            line, c.buf = c.buf.split(b"\n", 1)
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if not c.authed:
+                if not self._auth(c, msg):
+                    self._drop(c)
+                    return False
+                continue
+            try:
+                self.handle(msg)
+            except Exception as e:  # noqa: BLE001 - one bad message must not stop the bridge
+                print(f"omarchy-phone: {msg.get('t')}: {e!r}", file=sys.stderr, flush=True)
+        return True
+
+    def _auth(self, c, msg):
+        if msg.get("t") != "auth" or not hmac.compare_digest(str(msg.get("mac", "")), mac(self.token, "app:" + c.nonce)):
+            print(f"omarchy-phone: rejected a connection from {c.addr[0]}", file=sys.stderr, flush=True)
+            return False
+        c.send({"t": "ok", "mac": mac(self.token, "daemon:" + str(msg.get("nonce", "")))})
+        c.authed = True
+        self.pending.remove(c)
+        if self.conn:
+            self._drop(self.conn)
+        self.conn = c
+        print(f"omarchy-phone: phone connected from {c.addr[0]}", flush=True)
+        return True
+
+    def _tick(self):
+        now = time.monotonic()
+        for c in list(self.pending):
+            if now - c.born > 10:
+                self._drop(c)
+        if self.conn and not self.conn.send({"c": "ping"}):
+            self._drop(self.conn)
+        self.reply_procs = [p for p in self.reply_procs if p.poll() is None]
+        return True
+
+    def send(self, cmd):
+        if not self.conn:
+            return False
+        if cmd.get("c") in ("open", "action", "launch", "view", "settings") and "display" not in cmd:
+            d = android_display()
+            if d is not None:
+                cmd["display"] = d
+        if not self.conn.send(cmd):
+            self._drop(self.conn)
+            return False
+        return True
+
+    # ------------------------------------------------------------ messages from the phone
+
+    def handle(self, m):
+        t = m.get("t")
+        if t == "hello":
+            self.hello = m
+            self.send({"c": "apps"})
+        elif t == "notif":
+            self.show(m)
+        elif t == "notif-removed":
+            self.close_note(m["key"])
+        elif t == "notif-active":
+            keep = set(m.get("keys", []))
+            for key in [k for k in self.notes if k != CALL_KEY and k not in keep]:
+                self.close_note(key)
+        elif t == "cell":
+            self._set_cell(m)
+        elif t == "wifi":
+            wifi = {k: m.get(k) for k in ("enabled", "connected", "validated", "strength")}
+            wifi["bridge"] = True
+            write_in_place(RUNTIME / "wifi.json", json.dumps(wifi, separators=(",", ":")))
+        elif t == "calls":
+            self._set_calls(m.get("calls", []), m.get("muted", False), m.get("route", "earpiece"), m.get("bound", False))
+        elif t == "call-incoming":
+            self.phone.IncomingCall(str(m.get("id", "")))
+        elif t == "apps":
+            self.sync_apps(m.get("apps", []))
+        elif t == "icon":
+            self._save_icon(m["pkg"], m["png"])
+
+    def _set_cell(self, m):
+        cell = {k: m.get(k, NO_CELL[k]) for k in NO_CELL}
+        self.cell = cell
+        write_in_place(RUNTIME / "cell.json", json.dumps(cell, separators=(",", ":")))
+
+    def _save_icon(self, pkg, b64):
+        if "/" in pkg or pkg.startswith("."):
+            return None
+        path = ICONS / f"android-{pkg}.png"
+        data = base64.b64decode(b64)
+        try:
+            if path.read_bytes() == data:
+                return path
+        except OSError:
+            pass
+        path.write_bytes(data)
+        return path
+
+    # ------------------------------------------------------------ notifications
+
+    def show(self, m):
+        key, pkg = m["key"], m["pkg"]
+        if m.get("icon"):
+            self._save_icon(pkg, m["icon"])
+        icon = ICONS / f"android-{pkg}.png"
+        hints = {"urgency": self.dbus.Byte(1), "desktop-entry": self.dbus.String(f"android-{pkg}")}
+        if m.get("image"):
+            img = RUNTIME / f"img-{hashlib.sha1(key.encode()).hexdigest()[:16]}.png"
+            img.write_bytes(base64.b64decode(m["image"]))
+            hints["image-path"] = self.dbus.String(img.as_uri())
+        actions = ["default", "Open"]
+        names = {}
+        for a in m.get("actions", []):
+            aid = ("r" if a.get("reply") else "a") + str(a["i"])
+            actions += [aid, a["title"]]
+            names[aid] = a["title"]
+        title = m.get("title") or m.get("app") or pkg
+        body = m.get("text", "")
+        try:
+            nid = int(self._notifier().Notify(m.get("app") or pkg, self.dbus.UInt32(self.notes.get(key, 0)),
+                                              f"android-{pkg}" if icon.exists() else "phone", title,
+                                              markup(body) if self.markup else body, actions, hints, self.dbus.Int32(-1)))
+        except self.dbus.DBusException as e:
+            print(f"omarchy-phone: notify: {e}", file=sys.stderr, flush=True)
+            return
+        old = self.notes.get(key)
+        if old and old != nid:
+            self.ids.pop(old, None)
+        self.notes[key], self.ids[nid] = nid, key
+        self.note_actions[key] = {"title": title, "names": names}
+
+    def close_note(self, key):
+        nid = self.notes.pop(key, None)
+        self.note_actions.pop(key, None)
+        if nid is None:
+            return
+        self.ids.pop(nid, None)
+        try:
+            self._notifier().CloseNotification(self.dbus.UInt32(nid))
+        except self.dbus.DBusException:
+            pass
+
+    def on_action(self, nid, action):
+        key = self.ids.get(int(nid))
+        if key is None:
+            return
+        action = str(action)
+        if key == CALL_KEY:
+            ids = [c["id"] for c in self.calls]
+            ringing = [c["id"] for c in self.calls if c["state"] in ("ringing-in", "waiting")]
+            target = (ringing or ids or [""])[0]
+            if action == "answer":
+                self.send({"c": "call", "op": "answer", "id": target})
+            elif action == "decline":
+                self.send({"c": "call", "op": "decline", "id": target})
+            elif action == "hangup":
+                self.send({"c": "call", "op": "hangup", "id": ""})
+            elif action == "speaker":
+                self.send({"c": "call", "op": "route", "route": "earpiece" if self.route == "speaker" else "speaker"})
+            elif action == "mute":
+                self.send({"c": "call", "op": "mute", "on": not self.muted})
+            elif action == "default":
+                self.send({"c": "incall"})
+            return
+        if action == "default":
+            self.send({"c": "open", "key": key})
+        elif action.startswith("a"):
+            self.send({"c": "action", "key": key, "index": int(action[1:])})
+        elif action.startswith("r"):
+            info = self.note_actions.get(key, {})
+            self.ask_reply(key, int(action[1:]), info.get("title", ""), info.get("names", {}).get(action, "Reply"))
+
+    def on_closed(self, nid, reason):
+        key = self.ids.pop(int(nid), None)
+        if key is None or key == CALL_KEY:
+            if key == CALL_KEY:
+                self.notes.pop(CALL_KEY, None)
+            return
+        self.notes.pop(key, None)
+        if int(reason) == 2:      # dismissed by the user (not expired into the history)
+            self.send({"c": "dismiss", "key": key})
+
+    def ask_reply(self, key, index, title, label):
+        # A small GTK prompt (omarchy-phone-reply); the text goes back as the action's RemoteInput.
+        try:
+            p = subprocess.Popen(["omarchy-phone-reply", title, label], stdout=subprocess.PIPE, text=True)
+        except OSError:
+            self.send({"c": "open", "key": key})
+            return
+        self.reply_procs.append(p)
+
+        def done(*_a):
+            text = (p.stdout.read() or "").strip()
+            p.wait()
+            if text:
+                self.send({"c": "action", "key": key, "index": index, "text": text})
+            return False
+        self.GLib.io_add_watch(p.stdout.fileno(), self.GLib.IO_IN | self.GLib.IO_HUP, done)
+
+    # ------------------------------------------------------------ calls
+
+    def _set_calls(self, calls, muted, route, bound):
+        before = {c["id"]: c["state"] for c in self.calls}
+        self.calls = [{"id": str(c.get("id", "")), "number": str(c.get("number", "")), "name": str(c.get("name", "")),
+                       "direction": str(c.get("direction", "")), "state": str(c.get("state", "")),
+                       "startedMs": int(c.get("startedMs", 0)), "answeredMs": int(c.get("answeredMs", 0))} for c in calls]
+        props_changed = (muted, route, bound) != (self.muted, self.route, self.bound)
+        self.muted, self.route, self.bound = bool(muted), str(route), bool(bound)
+        after = {c["id"]: c["state"] for c in self.calls}
+        for cid, st in after.items():
+            if before.get(cid) != st:
+                self.phone.CallStateChanged(cid, st)
+        for cid in before:
+            if cid not in after:
+                self.phone.CallStateChanged(cid, "ended")
+        if props_changed:
+            self.phone.PropertiesChanged(PHONE, self.phone.props(), [])
+        self.call_notification()
+
+    def call_notification(self):
+        # The phone profile's call card (omamobile-call-watch owns org.omamobile.CallCard) shows calls
+        # itself; anywhere else a call rings, and stays, as a notification.
+        has_card = False
+        try:
+            has_card = bool(self.bus.name_has_owner(CALL_CARD))
+        except self.dbus.DBusException:
+            pass
+        ringing = [c for c in self.calls if c["state"] in ("ringing-in", "waiting")]
+        live = [c for c in self.calls if c["state"] in ("active", "held", "dialing", "ringing-out")]
+        call = (ringing or live or [None])[0]
+        if has_card or call is None:
+            if CALL_KEY in self.notes:
+                self.close_note(CALL_KEY)
+            self.call_note_state = None
+            return
+        who = call["name"] or call["number"] or "Unknown caller"
+        if ringing:
+            state = ("ringing", call["id"], who)
+            summary, body = "Incoming call", who + (f"\n{call['number']}" if call["name"] and call["number"] else "")
+            actions = ["answer", "Answer", "decline", "Decline", "default", "Phone"]
+            urgency, timeout = 2, 0
+        else:
+            state = ("live", call["id"], who, call["state"], self.muted, self.route)
+            summary = {"held": "Call on hold", "active": "On a call"}.get(call["state"], "Calling")
+            body = who
+            actions = ["hangup", "Hang up", "mute", "Unmute" if self.muted else "Mute",
+                       "speaker", "Earpiece" if self.route == "speaker" else "Speaker", "default", "Phone"]
+            # Critical, so the call's controls stay on screen (a normal toast slips into the history).
+            urgency, timeout = 2, 0
+        if state == self.call_note_state:
+            return
+        self.call_note_state = state
+        try:
+            nid = int(self._notifier().Notify("Phone", self.dbus.UInt32(self.notes.get(CALL_KEY, 0)), "call-start",
+                                              summary, markup(body) if self.markup else body, actions,
+                                              {"urgency": self.dbus.Byte(urgency), "resident": self.dbus.Boolean(True),
+                                               "category": self.dbus.String("call")}, self.dbus.Int32(timeout)))
+        except self.dbus.DBusException:
+            return
+        self.notes[CALL_KEY], self.ids[nid] = nid, CALL_KEY
+
+    def call(self, op, cid="", **extra):
+        cmd = {"c": "call", "op": op, "id": cid}
+        cmd.update(extra)
+        if not self.send(cmd):
+            raise self.dbus.exceptions.DBusException("The phone is not connected", name=PHONE + ".Error.NotConnected")
+
+    # ------------------------------------------------------------ Android apps in the launcher
+
+    def sync_apps(self, apps):
+        APPS_DIR.mkdir(parents=True, exist_ok=True)
+        counts = {}
+        for a in apps:
+            counts[a["pkg"]] = counts.get(a["pkg"], 0) + 1
+        keep, want_icons, versions = set(), [], {}
+        for a in apps:
+            pkg, act, label = a["pkg"], a["activity"], a["label"].replace("\n", " ").strip() or a["pkg"]
+            if pkg in HIDDEN_APPS or "/" in pkg:
+                continue
+            name = f"android-{pkg}" + ("" if counts[pkg] == 1 else "-" + act.rsplit(".", 1)[-1].lower()) + ".desktop"
+            keep.add(name)
+            entry = ("[Desktop Entry]\nType=Application\n"
+                     f"Name={label}\nComment=Android app\n"
+                     f"Exec=omarchy-phone launch {pkg}/{act}\n"
+                     f"Icon=android-{pkg}\n"
+                     "Categories=X-Android;\nTerminal=false\n"
+                     f"X-Omarchy-Phone-Package={pkg}\n")
+            path = APPS_DIR / name
+            try:
+                if path.read_text() == entry:
+                    entry = None
+            except OSError:
+                pass
+            if entry is not None:
+                path.write_text(entry)
+            versions[pkg] = a.get("version", 0)
+            if not (ICONS / f"android-{pkg}.png").exists() or self.versions.get(pkg) != versions[pkg]:
+                want_icons.append(pkg)
+        for path in APPS_DIR.glob("android-*.desktop"):
+            if path.name not in keep:
+                path.unlink()
+        self.versions = versions
+        (DATA / "apps.json").write_text(json.dumps(versions))
+        if want_icons:
+            self.send({"c": "icons", "pkgs": sorted(set(want_icons))})
+
+    # ------------------------------------------------------------ the CLI's control socket
+
+    def _control(self):
+        self._remove(CTL)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(str(CTL))
+        os.chmod(CTL, 0o600)
+        s.listen(4)
+        self.ctl = s
+        self.GLib.io_add_watch(s.fileno(), self.GLib.IO_IN, self._ctl_accept)
+
+    def _ctl_accept(self, *_a):
+        c, _ = self.ctl.accept()
+        c.settimeout(5)
+        try:
+            req = json.loads(c.makefile().readline() or "{}")
+            reply = self.control(req)
+        except Exception as e:  # noqa: BLE001
+            reply = {"ok": False, "error": str(e)}
+        try:
+            c.sendall((json.dumps(reply) + "\n").encode())
+        except OSError:
+            pass
+        c.close()
+        return True
+
+    def control(self, req):
+        op = req.get("op")
+        if op == "status":
+            return {"ok": True, "connected": self.conn is not None, "phone": self.hello.get("model"),
+                    "cell": self.cell, "calls": self.calls, "muted": self.muted, "route": self.route,
+                    "callService": self.bound, "notifications": len([k for k in self.notes if k != CALL_KEY])}
+        if op == "launch":
+            pkg, _, act = req["target"].partition("/")
+            ok = self.send({"c": "launch", "pkg": pkg, "activity": act})
+        elif op == "open":
+            uri = req["uri"]
+            cmd = {"c": "view", "uri": uri}
+            if req.get("body"):
+                cmd["body"] = req["body"]
+            ok = self.send(cmd)
+        elif op == "sms":
+            ok = self.send({"c": "sms", "number": req["number"], "text": req["text"]})
+        elif op == "incall":
+            ok = self.send({"c": "incall"})
+        elif op == "apps":
+            ok = self.send({"c": "apps"})
+        elif op == "settings":
+            ok = self.send({"c": "settings", "page": req.get("page") or "wifi"})
+        elif op == "test-call":
+            ok = self.send({"c": "test-call", "number": req.get("number") or "+15550100", "name": req.get("name") or "Test call"})
+        else:
+            return {"ok": False, "error": f"unknown request {op!r}"}
+        return {"ok": ok} if ok else {"ok": False, "error": "the phone is not connected"}
+
+    def run(self):
+        self.loop.run()
+
+
+def make_phone_agent(bridge):
+    import dbus
+    import dbus.service
+
+    class PhoneAgent(dbus.service.Object):
+        """org.omamobile.Phone1 (omatel's agent API) backed by Android's Telecom."""
+
+        def __init__(self):
+            self.name = dbus.service.BusName(PHONE, bridge.bus)
+            super().__init__(bridge.bus, PHONE_PATH)
+
+        def props(self):
+            return {"Muted": dbus.Boolean(bridge.muted), "Route": dbus.String(bridge.route),
+                    "AudioRouting": dbus.Boolean(bridge.bound), "SilencedCalls": dbus.Array([], signature="s")}
+
+        @dbus.service.method(PHONE, out_signature="a(sssssxx)")
+        def ListCalls(self):
+            return dbus.Array([dbus.Struct((c["id"], c["number"], c["name"], c["direction"], c["state"],
+                                            dbus.Int64(c["startedMs"]), dbus.Int64(c["answeredMs"])))
+                               for c in bridge.calls], signature="(sssssxx)")
+
+        @dbus.service.method(PHONE, in_signature="s")
+        def Answer(self, cid):
+            bridge.call("answer", str(cid))
+
+        @dbus.service.method(PHONE, in_signature="s")
+        def Decline(self, cid):
+            bridge.call("decline", str(cid))
+
+        @dbus.service.method(PHONE, in_signature="s")
+        def Hangup(self, cid):
+            bridge.call("hangup", str(cid))
+
+        @dbus.service.method(PHONE, in_signature="b")
+        def SetMute(self, on):
+            bridge.call("mute", on=bool(on))
+
+        @dbus.service.method(PHONE, in_signature="s")
+        def SetRoute(self, route):
+            bridge.call("route", route=str(route))
+
+        @dbus.service.method(PROPS, in_signature="s", out_signature="a{sv}")
+        def GetAll(self, iface):
+            return self.props() if iface in ("", PHONE) else {}
+
+        @dbus.service.method(PROPS, in_signature="ss", out_signature="v")
+        def Get(self, iface, name):
+            return self.props()[str(name)]
+
+        @dbus.service.signal(PROPS, signature="sa{sv}as")
+        def PropertiesChanged(self, iface, changed, invalidated):
+            pass
+
+        @dbus.service.signal(PHONE, signature="s")
+        def IncomingCall(self, cid):
+            pass
+
+        @dbus.service.signal(PHONE, signature="ss")
+        def CallStateChanged(self, cid, state):
+            pass
+
+    return PhoneAgent()
+
+
+def make_messages_agent(bridge):
+    import dbus
+    import dbus.service
+
+    class MessagesAgent(dbus.service.Object):
+        """org.omamobile.Messages1: the call card's quick replies, sent as SMS by Android."""
+
+        def __init__(self):
+            self.name = dbus.service.BusName(MESSAGES, bridge.bus)
+            super().__init__(bridge.bus, MESSAGES_PATH)
+
+        @dbus.service.method(MESSAGES, in_signature="ss")
+        def Send(self, number, text):
+            if not bridge.send({"c": "sms", "number": str(number), "text": str(text)}):
+                raise dbus.exceptions.DBusException("The phone is not connected", name=MESSAGES + ".Error.NotConnected")
+
+    return MessagesAgent()
+
+
+def request(req):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(10)
+    try:
+        s.connect(str(CTL))
+    except OSError:
+        print("omarchy-phone: the daemon is not running (systemctl --user status omarchy-phone)", file=sys.stderr)
+        return 2
+    s.sendall((json.dumps(req) + "\n").encode())
+    reply = json.loads(s.makefile().readline() or "{}")
+    if req["op"] == "status":
+        print(json.dumps(reply, indent=2))
+    elif not reply.get("ok"):
+        print("omarchy-phone: " + reply.get("error", "failed"), file=sys.stderr)
+        subprocess.run(["notify-send", "-a", "Phone", "-i", "phone", "Phone", reply.get("error", "failed")])
+        return 1
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    cmd, args = argv[0], argv[1:]
+    if cmd == "daemon":
+        Bridge().run()
+        return 0
+    if cmd == "launch" and args:
+        return request({"op": "launch", "target": args[0]})
+    if cmd == "open" and args:
+        uri = args[0]
+        body = None
+        if uri.lower().startswith(("sms:", "smsto:")) and "?body=" in uri:
+            from urllib.parse import unquote
+            uri, _, body = uri.partition("?body=")
+            body = unquote(body)
+        return request({"op": "open", "uri": uri, "body": body})
+    if cmd == "sms" and len(args) >= 2:
+        return request({"op": "sms", "number": args[0], "text": " ".join(args[1:])})
+    if cmd == "settings":
+        return request({"op": "settings", "page": args[0] if args else "wifi"})
+    if cmd == "test-call":
+        return request({"op": "test-call", "number": args[0] if args else None, "name": " ".join(args[1:]) or None})
+    if cmd in ("incall", "apps", "status"):
+        return request({"op": cmd})
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

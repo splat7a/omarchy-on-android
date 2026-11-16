@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Omarchy Phone: the Android half of the S22 phone bridge. It has no screen of its own; it hands
+     notifications, calls, signal and Wi-Fi state to the omarchy-phone daemon in the Omarchy container
+     and carries out what Omarchy asks (open a notification, answer a call, send an SMS, launch an app). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.s22.omarchyphone"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="33" android:targetSdkVersion="36" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <uses-permission android:name="android.permission.READ_CALL_LOG" />
+    <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-permission android:name="android.permission.MANAGE_ONGOING_CALLS" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
+
+    <application
+        android:label="Omarchy Phone"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:allowBackup="false"
+        android:persistent="false">
+
+        <service
+            android:name=".BridgeListener"
+            android:label="Omarchy Phone"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- Bound by Telecom for every call once MANAGE_ONGOING_CALLS is allowed (a non-UI in-call
+             service, as watch companion apps use): it reports calls and answers, declines, mutes. -->
+        <service
+            android:name=".CallCompanion"
+            android:exported="true"
+            android:permission="android.permission.BIND_INCALL_SERVICE">
+            <!-- VoIP apps' calls (self-managed: WhatsApp, Signal, ...) reach Omarchy too. -->
+            <meta-data android:name="android.telecom.INCLUDE_SELF_MANAGED_CALLS" android:value="true" />
+            <intent-filter>
+                <action android:name="android.telecom.InCallService" />
+            </intent-filter>
+        </service>
+
+        <!-- Pretend calls for trying the call path without a SIM (omarchy-phone test-call). -->
+        <service
+            android:name=".TestCallService"
+            android:exported="true"
+            android:permission="android.permission.BIND_TELECOM_CONNECTION_SERVICE">
+            <intent-filter>
+                <action android:name="android.telecom.ConnectionService" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>

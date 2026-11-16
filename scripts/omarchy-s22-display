@@ -1,0 +1,43 @@
+#!/bin/bash
+# Omarchy on the S22: follow the Anland output and switch between two profiles.
+#   phone   (portrait: the phone screen)      Omarchy Mobile's phone shell, touch keyboard, phone window rules
+#   desktop (landscape: an external monitor)  Omarchy's own desktop shell and rules
+# After a change: Hyprland config reload (phone rules are conditional on the profile file), an exact
+# monitor scale, and an Omarchy shell restart so the bar and wallpaper are laid out for the new size.
+PHONE_SCALE=${OMARCHY_S22_PHONE_SCALE:-4}      # 1440 px wide -> 360 logical, like a standard phone
+DESKTOP_SCALE=${OMARCHY_S22_DESKTOP_SCALE:-1}
+state_dir=${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-s22
+cfg=$HOME/.config/omarchy
+mkdir -p "$state_dir"
+last=""; last_profile=""
+while true; do
+    read -r name w h < <(hyprctl monitors -j 2>/dev/null |
+        jq -r '[.[] | select(.name | startswith("ANLAND"))][0] | "\(.name) \(.width) \(.height)"' 2>/dev/null)
+    if [[ -n $name && $name != null && "$w $h" != "$last" ]]; then
+        if (( h > w )); then profile=phone; scale=$PHONE_SCALE; else profile=desktop; scale=$DESKTOP_SCALE; fi
+        # Hyprland needs a scale that divides the pixel size exactly.
+        for s in $scale 4 3 2 1; do
+            if (( w % s == 0 && h % s == 0 )); then scale=$s; break; fi
+        done
+        if [[ $profile != "$last_profile" ]]; then
+            echo "$profile" > "$state_dir/profile"
+            [[ -f $cfg/shell.$profile.json ]] && cp "$cfg/shell.$profile.json" "$cfg/shell.json"
+            gsettings set org.gnome.desktop.a11y.applications screen-keyboard-enabled \
+                "$([[ $profile == phone ]] && echo true || echo false)" 2>/dev/null
+            # The on-screen keyboard (squeekboard) only on the phone screen.
+            if [[ $profile == phone ]]; then
+                systemctl --user start mobi.phosh.OSK.service 2>/dev/null
+            else
+                systemctl --user stop mobi.phosh.OSK.service 2>/dev/null
+            fi
+            hyprctl reload >/dev/null
+            sleep 1
+        fi
+        hyprctl eval "hl.monitor({ output = \"$name\", mode = \"preferred\", position = \"auto\", scale = $scale })" >/dev/null
+        sleep 1
+        omarchy-restart-shell >/dev/null 2>&1
+        echo "$(date '+%T') $name ${w}x${h} -> $profile (scale $scale)"
+        last="$w $h"; last_profile=$profile
+    fi
+    sleep 2
+done
